@@ -4,6 +4,8 @@ use crate::{
     MIGRATION_ADD_GROUP_BOUND_PATH_DESCRIPTION, MIGRATION_ADD_GROUP_BOUND_PATH_SQL,
     MIGRATION_ADD_GROUP_BOUND_PATH_VERSION, MIGRATION_ADD_PROJECT_PATH_MODE_DESCRIPTION,
     MIGRATION_ADD_PROJECT_PATH_MODE_SQL, MIGRATION_ADD_PROJECT_PATH_MODE_VERSION,
+    MIGRATION_ADD_PROJECT_PROXY_CONFIG_DESCRIPTION, MIGRATION_ADD_PROJECT_PROXY_CONFIG_SQL,
+    MIGRATION_ADD_PROJECT_PROXY_CONFIG_VERSION,
     MIGRATION_ADD_SSH_ATTACHMENT_ROOT_DESCRIPTION, MIGRATION_ADD_SSH_ATTACHMENT_ROOT_SQL,
     MIGRATION_ADD_SSH_ATTACHMENT_ROOT_VERSION, MIGRATION_ADD_USAGE_ERROR_DETAIL_DESCRIPTION,
     MIGRATION_ADD_USAGE_ERROR_DETAIL_SQL, MIGRATION_ADD_USAGE_ERROR_DETAIL_VERSION,
@@ -19,6 +21,7 @@ use crate::{
     NODE_APPEARANCE_MIGRATION_SQL, NODE_APPEARANCE_MIGRATION_VERSION,
 };
 use serde::Serialize;
+#[cfg(test)]
 use serde_json::Value;
 use sha2::{Digest, Sha384};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
@@ -30,15 +33,25 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
+mod replay_cleanup;
+
+use replay_cleanup::{
+    cleanup_replay_snapshot_inline_patches_for_current_version, prune_expired_replay_sessions,
+    replay_retention_cutoff, slim_replay_snapshot_payloads_once,
+};
+#[cfg(test)]
+use replay_cleanup::{
+    cleanup_replay_snapshot_inline_patches, cli_manager_db_needs_vacuum,
+    replay_snapshot_cleanup_marker_path, slim_replay_snapshot_payloads, REPLAY_SNAPSHOT_PATCH_DIR,
+    REPLAY_SNAPSHOT_PATCH_STORAGE, REPLAY_SNAPSHOT_SLIM_MARKER_FILE,
+};
+
 const SQLX_MIGRATIONS_TABLE: &str = "_sqlx_migrations";
 const KNOWN_DRIFT_START_VERSION: i64 = 13;
 const KNOWN_DRIFT_END_VERSION: i64 = 15;
 // 已移除的供应商原型迁移窗口：25 建原型 providers/provider_keys，26 建 managed_* 原型表。
 const PROVIDER_PROTOTYPE_TOMBSTONE_START_VERSION: i64 = 25;
 const PROVIDER_PROTOTYPE_TOMBSTONE_END_VERSION: i64 = 26;
-const REPLAY_SNAPSHOT_PATCH_DIR: &str = "replay-snapshots";
-const REPLAY_SNAPSHOT_PATCH_STORAGE: &str = "file";
-const REPLAY_SNAPSHOT_CLEANUP_MARKER_FILE: &str = "replay-snapshot-patch-cleanup.version";
 const LEGACY_MODEL_PRICES_MIGRATION_MARKER_FILE: &str = "legacy-model-prices-migration-v1.version";
 const DB_FILE_NAME: &str = "cli-manager.db";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -202,6 +215,10 @@ pub async fn db_repair_known_migration_drift(
         result.repaired = true;
         result.status = append_repair_status(&result.status, "repaired_ssh_attachment_root_column");
     }
+    if ensure_project_proxy_config_column(&mut conn).await? {
+        result.repaired = true;
+        result.status = append_repair_status(&result.status, "repaired_project_proxy_config_column");
+    }
     if defer_request_log_project_path_backfill(&mut conn).await? {
         result.repaired = true;
         result.status =
@@ -244,6 +261,21 @@ pub async fn db_repair_known_migration_drift(
         }
     }
     let mut conn = open_cli_manager_db(&db_path).await?;
+    match prune_expired_replay_sessions(
+        &mut conn,
+        &app_paths::cli_manager_data_dir()?,
+        &replay_retention_cutoff(chrono::Utc::now()),
+    )
+    .await
+    {
+        Ok(pruned) if pruned > 0 => {
+            result.repaired = true;
+            result.status =
+                append_repair_status(&result.status, &format!("replay_sessions_pruned_{pruned}"));
+        }
+        Ok(_) => {}
+        Err(err) => log::warn!("Replay session retention skipped: {err}"),
+    }
     match cleanup_replay_snapshot_inline_patches_for_current_version(
         &mut conn,
         &app_paths::cli_manager_data_dir()?,
@@ -265,6 +297,17 @@ pub async fn db_repair_known_migration_drift(
         Err(err) => {
             log::warn!("Replay snapshot patch cleanup skipped: {err}");
         }
+    }
+    match slim_replay_snapshot_payloads_once(&mut conn, &app_paths::cli_manager_data_dir()?).await {
+        Ok(slimmed) if slimmed > 0 => {
+            result.repaired = true;
+            result.status = append_repair_status(
+                &result.status,
+                &format!("replay_snapshot_payload_slimmed_{slimmed}"),
+            );
+        }
+        Ok(_) => {}
+        Err(err) => log::warn!("Replay snapshot payload slim skipped: {err}"),
     }
     Ok(result)
 }
@@ -586,6 +629,75 @@ async fn ensure_ssh_attachment_root_column(conn: &mut SqliteConnection) -> Resul
                 .execute(&mut *conn)
                 .await
                 .map_err(|err| format!("ssh_attachment_root_repair_commit_failed: {err}"))?;
+            Ok(true)
+        }
+        Err(err) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(err)
+        }
+    }
+}
+
+/// 项目代理配置列缺失自愈。
+///
+/// migration 43 只有一条 `ADD COLUMN`。在 SQLx `Database.load` 前同时修复
+/// “列缺失但版本已登记”、“列存在但版本未登记”和“两者都缺失”三种状态。
+async fn ensure_project_proxy_config_column(conn: &mut SqliteConnection) -> Result<bool, String> {
+    if !table_exists(conn, SQLX_MIGRATIONS_TABLE).await? || !table_exists(conn, "projects").await? {
+        return Ok(false);
+    }
+
+    let columns = table_columns(conn, "projects").await?;
+    let has_column = columns.contains("proxy_config");
+    let registered: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM _sqlx_migrations
+             WHERE version = ?1 AND success = 1
+         )",
+    )
+    .bind(MIGRATION_ADD_PROJECT_PROXY_CONFIG_VERSION)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| format!("project_proxy_config_migration_query_failed: {err}"))?;
+
+    if has_column && registered != 0 {
+        return Ok(false);
+    }
+
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| format!("project_proxy_config_repair_begin_failed: {err}"))?;
+    let result = async {
+        if !has_column {
+            sqlx::query(MIGRATION_ADD_PROJECT_PROXY_CONFIG_SQL)
+                .execute(&mut *conn)
+                .await
+                .map_err(|err| format!("project_proxy_config_repair_alter_failed: {err}"))?;
+        }
+        if registered == 0 {
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations
+                     (version, description, installed_on, success, checksum, execution_time)
+                 VALUES (?1, ?2, CURRENT_TIMESTAMP, 1, ?3, 0)",
+            )
+            .bind(MIGRATION_ADD_PROJECT_PROXY_CONFIG_VERSION)
+            .bind(MIGRATION_ADD_PROJECT_PROXY_CONFIG_DESCRIPTION)
+            .bind(migration_checksum(MIGRATION_ADD_PROJECT_PROXY_CONFIG_SQL))
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| format!("project_proxy_config_repair_register_failed: {err}"))?;
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            sqlx::query("COMMIT")
+                .execute(&mut *conn)
+                .await
+                .map_err(|err| format!("project_proxy_config_repair_commit_failed: {err}"))?;
             Ok(true)
         }
         Err(err) => {
@@ -1305,205 +1417,6 @@ async fn repair_known_migration_drift(
         repaired: true,
         status: "repaired_known_migration_drift".to_string(),
     })
-}
-
-// 查询内联快照补丁并在事务中迁出到文件，成功后尽力收缩数据库。
-async fn cleanup_replay_snapshot_inline_patches(
-    conn: &mut SqliteConnection,
-    data_dir: &Path,
-) -> Result<usize, String> {
-    if !table_exists(conn, "ai_replay_events").await? {
-        return Ok(0);
-    }
-
-    let rows = sqlx::query(
-        "SELECT id, session_key, event_index, payload_json
-         FROM ai_replay_events
-         WHERE kind = 'snapshot' AND payload_json LIKE ?1
-         ORDER BY id",
-    )
-    .bind("%\"patch\"%")
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|err| format!("replay_snapshot_cleanup_query_failed: {err}"))?;
-
-    if rows.is_empty() {
-        return Ok(0);
-    }
-
-    fs::create_dir_all(data_dir.join(REPLAY_SNAPSHOT_PATCH_DIR))
-        .map_err(|err| format!("replay_snapshot_cleanup_dir_failed: {err}"))?;
-
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut *conn)
-        .await
-        .map_err(|err| format!("replay_snapshot_cleanup_begin_failed: {err}"))?;
-
-    let result = cleanup_replay_snapshot_inline_patches_in_transaction(conn, data_dir, &rows).await;
-    if result.is_ok() {
-        sqlx::query("COMMIT")
-            .execute(&mut *conn)
-            .await
-            .map_err(|err| format!("replay_snapshot_cleanup_commit_failed: {err}"))?;
-    } else {
-        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-    }
-
-    let migrated = result?;
-    if migrated > 0 {
-        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&mut *conn)
-            .await;
-        if let Err(err) = sqlx::query("VACUUM").execute(&mut *conn).await {
-            log::warn!("Replay snapshot DB vacuum skipped: {err}");
-        }
-        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&mut *conn)
-            .await;
-    }
-
-    Ok(migrated)
-}
-
-// 按应用版本标记控制内联快照补丁清理，成功后记录当前版本。
-async fn cleanup_replay_snapshot_inline_patches_for_current_version(
-    conn: &mut SqliteConnection,
-    data_dir: &Path,
-) -> Result<usize, String> {
-    if replay_snapshot_cleanup_marker_path(data_dir).is_file()
-        && fs::read_to_string(replay_snapshot_cleanup_marker_path(data_dir))
-            .map(|value| value.trim() == APP_VERSION)
-            .unwrap_or(false)
-    {
-        return Ok(0);
-    }
-
-    let migrated = cleanup_replay_snapshot_inline_patches(conn, data_dir).await?;
-    fs::create_dir_all(data_dir)
-        .map_err(|err| format!("replay_snapshot_cleanup_marker_dir_failed: {err}"))?;
-    fs::write(replay_snapshot_cleanup_marker_path(data_dir), APP_VERSION)
-        .map_err(|err| format!("replay_snapshot_cleanup_marker_write_failed: {err}"))?;
-    Ok(migrated)
-}
-
-// 返回快照补丁清理版本标记的应用数据路径。
-fn replay_snapshot_cleanup_marker_path(data_dir: &Path) -> std::path::PathBuf {
-    data_dir.join(REPLAY_SNAPSHOT_CLEANUP_MARKER_FILE)
-}
-
-// 在现有事务中逐条写出快照补丁文件，并将数据库载荷改为文件引用。
-async fn cleanup_replay_snapshot_inline_patches_in_transaction(
-    conn: &mut SqliteConnection,
-    data_dir: &Path,
-    rows: &[SqliteRow],
-) -> Result<usize, String> {
-    let mut migrated = 0usize;
-
-    for row in rows {
-        let id: i64 = row
-            .try_get("id")
-            .map_err(|err| format!("replay_snapshot_cleanup_row_failed: {err}"))?;
-        let session_key: String = row
-            .try_get("session_key")
-            .map_err(|err| format!("replay_snapshot_cleanup_row_failed: {err}"))?;
-        let event_index: i64 = row
-            .try_get("event_index")
-            .map_err(|err| format!("replay_snapshot_cleanup_row_failed: {err}"))?;
-        let payload_json: String = row
-            .try_get("payload_json")
-            .map_err(|err| format!("replay_snapshot_cleanup_row_failed: {err}"))?;
-
-        let Ok(mut payload) = serde_json::from_str::<Value>(&payload_json) else {
-            log::warn!("Replay snapshot cleanup skipped malformed payload row id={id}");
-            continue;
-        };
-        let Some(object) = payload.as_object_mut() else {
-            continue;
-        };
-        let Some(patch) = object
-            .get("patch")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-
-        let checkpoint_id = object
-            .get("checkpointId")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("event-{event_index}"));
-        let relative_path = replay_snapshot_patch_relative_path(&session_key, &checkpoint_id);
-        let target_path = data_dir.join(&relative_path);
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("replay_snapshot_cleanup_dir_failed: {err}"))?;
-        }
-        fs::write(&target_path, patch.as_bytes())
-            .map_err(|err| format!("replay_snapshot_cleanup_write_failed: {err}"))?;
-
-        let patch_bytes = patch.len() as u64;
-        object.remove("patch");
-        object.insert("patchPath".to_string(), Value::String(relative_path));
-        object.insert(
-            "patchStorage".to_string(),
-            Value::String(REPLAY_SNAPSHOT_PATCH_STORAGE.to_string()),
-        );
-        if object.get("patchBytes").and_then(Value::as_u64).is_none() {
-            object.insert(
-                "patchBytes".to_string(),
-                Value::Number(serde_json::Number::from(patch_bytes)),
-            );
-        }
-        object.insert(
-            "patchStoredAt".to_string(),
-            Value::String(chrono::Utc::now().to_rfc3339()),
-        );
-
-        let updated_payload_json = serde_json::to_string(&payload)
-            .map_err(|err| format!("replay_snapshot_cleanup_serialize_failed: {err}"))?;
-        sqlx::query("UPDATE ai_replay_events SET payload_json = ?1 WHERE id = ?2")
-            .bind(updated_payload_json)
-            .bind(id)
-            .execute(&mut *conn)
-            .await
-            .map_err(|err| format!("replay_snapshot_cleanup_update_failed: {err}"))?;
-        migrated += 1;
-    }
-
-    Ok(migrated)
-}
-
-// 用清理后的会话与检查点标识生成快照补丁相对路径。
-fn replay_snapshot_patch_relative_path(session_key: &str, checkpoint_id: &str) -> String {
-    format!(
-        "{}/{}/{}.patch",
-        REPLAY_SNAPSHOT_PATCH_DIR,
-        sanitize_snapshot_path_segment(session_key, "session"),
-        sanitize_snapshot_path_segment(checkpoint_id, "snapshot")
-    )
-}
-
-// 将路径片段限制为安全 ASCII 字符和最多 120 字节，空结果使用回退名称。
-fn sanitize_snapshot_path_segment(value: &str, fallback: &str) -> String {
-    let mut safe = String::with_capacity(value.len().min(120));
-    for ch in value.trim().chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
-            safe.push(ch);
-        } else {
-            safe.push('-');
-        }
-        if safe.len() >= 120 {
-            break;
-        }
-    }
-    let trimmed = safe.trim_matches(['.', '-']);
-    if trimmed.is_empty() {
-        fallback.to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 // 按完整物理功能结构生成当前迁移清单，拒绝部分存在的功能结构。
